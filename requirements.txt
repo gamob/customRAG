@@ -29,3 +29,5 @@ python-dotenv==1.0.0
 
 # Ollama Integration
 ollama==0.1.9
+arize-phoenix-evals>=3.0.0
+litellm>=1.0.0

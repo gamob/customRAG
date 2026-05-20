@@ -4,354 +4,49 @@ generate_evals.py — Phase 2 (RAG inference) + Phase 3 (judge & report) + Faith
 Questions are loaded from evaluation/eval_test.jsonl, eval_train.jsonl, or eval_valid.jsonl
 (created by merge_eval_datasets.py).
 
-Features:
-- Hybrid RAG retrieval with configurable fusion strategies
-- LLM-based semantic judging (correct/partial/wrong)
-- Faithfulness evaluation (answer grounding in source documents)
-
-Usage:
-    python generate_evals.py                           # default: uses eval_test.jsonl (all questions)
-    python generate_evals.py --dataset test            # uses eval_test.jsonl
-    python generate_evals.py --dataset train           # uses eval_train.jsonl
-    python generate_evals.py --dataset valid           # uses eval_valid.jsonl
-    python generate_evals.py --dataset test --sample 5 # test with random 5 questions
+This file is now a thin orchestrator that imports Phase 2 and Phase 3 logic from
+separate modules under src/eval.
 """
-import logging
-import random
-import json
-import os
-import re
-import time
-import sys
 import argparse
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import json
+import logging
+import os
+import subprocess
+import sys
+import time
+
+from . import phase2, phase3, utils
+from .phase3 import run_judge_and_report
+from .utils import configure_logging, get_data_file, EVAL_DIR, build_ollama_llm
 from ..core.brain_service import Brain
-from ..core.generate import answer_question
 from langchain_ollama import OllamaLLM
-from ..core.faithfulness_check import evaluate_answer_faithfulness
+
+PHASE3_TIMEOUT = 120
 
 logger = logging.getLogger(__name__)
 
 
-def configure_logging(level=logging.INFO):
-    logging.basicConfig(
-        level=level,
-        format='%(asctime)s | %(levelname)s | %(message)s',
-        handlers=[logging.StreamHandler(sys.stdout)],
-        force=True,
-    )
-    logging.getLogger().setLevel(level)
-
-# ── Paths ─────────────────────────────────────────────────────────────────────
-EVAL_DIR     = "evaluation"
-
-
-def get_data_file(dataset_type="test"):
-    """Get the appropriate eval dataset file based on type.
-    
-    Args:
-        dataset_type: One of 'test', 'train', or 'valid'
-    
-    Returns:
-        Path to the eval dataset file
-    """
-    if dataset_type not in ["test", "train", "valid"]:
-        dataset_type = "test"
-    return os.path.join(EVAL_DIR, f"eval_{dataset_type}.jsonl")
-
-
-# ── Concurrency & timeouts ────────────────────────────────────────────────────
-PHASE2_WORKERS  = 1     # overlap reranking with LLM wait time
-PHASE3_WORKERS  = 1     # 27B model: serialise judge calls, no queue overhead
-PHASE2_TIMEOUT  = 1000  # seconds per question
-PHASE3_TIMEOUT  = 1000  # seconds per question
-
-# ── Judge LLM (use fast model — 8B is enough for semantic comparison) ─────────
-judge_llm = OllamaLLM(
-    model="local-llama3.1",
-    base_url="http://localhost:11434",
-    temperature=0.0,
-    num_ctx=4096,
-)
-
-
-# ── Shared helper ─────────────────────────────────────────────────────────────
-def _extract_json(text: str) -> dict:
-    """Robustly extract a JSON object from LLM output."""
-    text = text.replace("```json", "").replace("```", "").strip()
+def _stop_ollama_model(model_name=None):
     try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-
-    # If the output contains extra text around the JSON, try to recover the first valid object.
-    for start_match in re.finditer(r"\{", text):
-        depth = 0
-        for idx in range(start_match.start(), len(text)):
-            char = text[idx]
-            if char == "{":
-                depth += 1
-            elif char == "}":
-                depth -= 1
-            if depth == 0:
-                candidate = text[start_match.start() : idx + 1]
-                try:
-                    return json.loads(candidate)
-                except json.JSONDecodeError:
-                    break
-
-    # Last resort: attempt to clean up a single object block and parse it.
-    match = re.search(r"\{[\s\S]*\}", text)
-    if match:
-        candidate = re.sub(r",\s*([}\]])", r"\1", match.group())
-        try:
-            return json.loads(candidate)
-        except json.JSONDecodeError:
-            pass
-
-    raise ValueError(f"No JSON found: {text[:200]}")
-
-
-# ── PHASE 2: RAG Inference ────────────────────────────────────────────────────
-def _answer_one(item):
-    """Answer one question. Returns (idx, data) or (idx, None) on error."""
-    idx, data, brain = item
-    try:
-        logger.info(f"  ⏳ Starting Q{idx+1}: {data['question'][:100]}")
-        docs, _, confidence_pct = brain.search(data["question"])
-        logger.info(f"  🔎 Search returned {len(docs)} docs for Q{idx+1}")
-        rag_answer, sources = answer_question(
-            data["question"], 
-            docs,
-            confidence=confidence_pct / 100.0  # Convert percentage to decimal (0-1)
-        )
-        data["rag_answer"] = rag_answer
-        
-        # NEW: Evaluate faithfulness of the answer
-        faithfulness_result = evaluate_answer_faithfulness(rag_answer, docs)
-        data["faithfulness"] = faithfulness_result
-        
-        src_label = f" [{sources[0]}]" if sources else ""
-        logger.info(f"\n  Q{idx+1}{src_label}: {data['question'][:80]}")
-        logger.info(f"  💬 {rag_answer[:200]}{'...' if len(rag_answer) > 200 else ''}")
-        logger.info(f"  🔍 Faithfulness: {faithfulness_result['confidence_level']} ({faithfulness_result['overall_score']:.2f})")
-        return idx, data
-    except Exception as e:
-        logger.error(f"  ❌ Q{idx+1} error: {e}")
-        return idx, None
-
-
-def run_rag_inference(brain, args, data_file, rag_answers):
-    # Update the print to show whether we are running a subset or all questions
-    if args.sample is not None and args.sample > 0:
-        logger.info(f"🤖 Phase 2: Answering (Random {args.sample} of {PHASE2_WORKERS} workers, timeout={PHASE2_TIMEOUT}s)...")
-    else:
-        logger.info(f"🤖 Phase 2: Answering (All questions with {PHASE2_WORKERS} workers, timeout={PHASE2_TIMEOUT}s)...")
-    t0 = time.time()
-
-    # 1. Load ALL available questions from the file first[cite: 2]
-    all_raw_data = []
-    with open(data_file, "r", encoding="utf-8") as fin:
-        for line in fin:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                all_raw_data.append(json.loads(line))
-            except json.JSONDecodeError:
-                logger.warning(f"  ⚠️  Malformed line skipped: {line[:50]}...")
-
-    # 2. Randomly select N questions or use all if sample is 0 or negative
-    if args.sample is not None and args.sample > 0:
-        num_to_test = min(args.sample, len(all_raw_data))
-        selected_questions = random.sample(all_raw_data, num_to_test)
-        logger.info(f"  🎲 Randomly selected {num_to_test} questions for this test run.")
-    else:
-        num_to_test = len(all_raw_data)
-        selected_questions = all_raw_data
-        logger.info(f"  📊 Using all {num_to_test} questions from {args.dataset} dataset.")
-
-    # 3. Prepare the items for processing[cite: 2]
-    # We use enumerate so we can track the index for the results list[cite: 2]
-    items = [(i, data, brain) for i, data in enumerate(selected_questions)]
-
-    # 4. Execute the threads for just these 5 questions[cite: 2]
-    results = [None] * len(items)
-    done = 0
-    with ThreadPoolExecutor(max_workers=PHASE2_WORKERS) as pool:
-        futures = {pool.submit(_answer_one, item): item[0] for item in items}
-        for future in as_completed(futures, timeout=PHASE2_TIMEOUT):
-            try:
-                idx, data = future.result(timeout=PHASE2_TIMEOUT)
-            except Exception as e:
-                idx = futures[future]
-                logger.error(f"  💥 Q{idx+1} crashed: {e}")
-                done += 1
-                continue
-            results[idx] = data
-            done += 1
-            # Updated progress print[cite: 2]
-            if done == len(items):
-                logger.info(f"  ✅ {done}/{len(items)} answered")
-
-    # 5. Save only the answered questions to the RAG_ANSWERS file[cite: 2]
-    count = 0
-    with open(rag_answers, "w", encoding="utf-8") as fout:
-        for data in results:
-            if data is not None:
-                fout.write(json.dumps(data, ensure_ascii=False) + "\n")
-                count += 1
-
-    logger.info(f"\n🎉 Phase 2 done — {count}/{len(items)} answered in {time.time()-t0:.1f}s")
-
-
-# ── PHASE 3: Judge & Report ───────────────────────────────────────────────────
-def _judge_one(item):
-    """Judge one Q&A pair. Returns (idx, data_with_score) or (idx, None)."""
-    idx, data = item
-    prompt = (
-        "You are a semantic evaluator. Judge whether the model answer conveys "
-        "the same meaning as the expected answer.\n"
-        "Return ONLY a raw JSON object — no text outside it.\n\n"
-        f"Question: {data['question']}\n"
-        f"Expected answer: {data['answer']}\n"
-        f"Model answer: {data['rag_answer']}\n\n"
-        "Scoring guide:\n"
-        "  2 = Correct: same meaning, even if wording or language differs\n"
-        "  1 = Partial: right idea but missing one important detail\n"
-        "  0 = Wrong: factually incorrect, irrelevant, or could not find the answer\n\n"
-        "Do NOT mark wrong for extra words, different phrasing, or different language"
-        " — judge MEANING only.\n\n"
-        'Return exactly: {"score": 2, "reason": "brief explanation"}'
-    )
-    try:
-        res = judge_llm.invoke(prompt)
-        result = _extract_json(res)
-        result["score"] = int(result.get("score", 0))
-        data.update(result)
-
-        faith_score = data.get("faithfulness", {}).get("overall_score", 0.5)
-        judge_norm = result["score"] / 2.0
-        combined_score = 0.7 * judge_norm + 0.3 * faith_score
-        data["combined_score"] = float(combined_score)
-
-        if combined_score >= 0.85:
-            data["combined_judgement"] = 2
-        elif combined_score >= 0.6:
-            data["combined_judgement"] = 1
+        if model_name:
+            logger.info(f"🛑 Stopping Ollama model: {model_name}")
+            subprocess.run(["ollama", "stop", model_name], timeout=10, capture_output=True)
         else:
-            data["combined_judgement"] = 0
-
-        return idx, data
+            logger.info(f"🛑 Stopping all Ollama models")
+            subprocess.run(["ollama", "stop"], timeout=10, capture_output=True)
+        time.sleep(1)
+        logger.info("   Model stopped successfully")
     except Exception as e:
-        logger.error(f"  ⚠️  Judge failed on Q{idx+1}: {e}")
-        return idx, None
+        logger.warning(f"   Warning: Could not stop model: {e}")
 
 
-def run_judge_and_report(rag_answers, final_report):
-    logger.info(f"⚖️  Phase 3: Grading ({PHASE3_WORKERS} worker, timeout={PHASE3_TIMEOUT}s)...\n")
-    t0 = time.time()
-
-    items = []
-    with open(rag_answers, "r", encoding="utf-8") as fin:
-        for i, line in enumerate(fin):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                items.append((i, json.loads(line)))
-            except json.JSONDecodeError:
-                logger.warning(f"  ⚠️  Skipping malformed line {i+1}")
-
-    results       = [None] * len(items)
-    correct = partial = wrong = parse_failures = total_score = 0
-    combined_correct = combined_partial = combined_wrong = 0
-    combined_total_score = 0.0
-
-    with ThreadPoolExecutor(max_workers=PHASE3_WORKERS) as pool:
-        futures = {pool.submit(_judge_one, item): item[0] for item in items}
-        for future in as_completed(futures, timeout=PHASE3_TIMEOUT):
-            try:
-                idx, data = future.result(timeout=PHASE3_TIMEOUT)
-            except Exception as e:
-                idx = futures[future]
-                logger.error(f"  💥 Q{idx+1} crashed: {e}")
-                parse_failures += 1
-                continue
-            results[idx] = data
-            if data is not None:
-                score = data.get("score", 0)
-                combined_score = data.get("combined_score", 0.0)
-                combined_judgement = data.get("combined_judgement", 0)
-                total_score += score
-                combined_total_score += combined_score
-
-                if score == 2:
-                    correct += 1
-                    status = "✅ CORRECT"
-                elif score == 1:
-                    partial += 1
-                    status = "⚠️  PARTIAL"
-                else:
-                    wrong += 1
-                    status = "❌ WRONG"
-
-                if combined_judgement == 2:
-                    combined_correct += 1
-                    combined_status = "✅ CORRECT"
-                elif combined_judgement == 1:
-                    combined_partial += 1
-                    combined_status = "⚠️  PARTIAL"
-                else:
-                    combined_wrong += 1
-                    combined_status = "❌ WRONG"
-
-                logger.info(
-                    f"Q{idx+1}: {status} | {data.get('reason','')[:80]} "
-                    f"| combined {combined_status} ({combined_score:.2f})"
-                )
-            else:
-                parse_failures += 1
-                logger.warning(f"  ⚠️  Q{idx+1}: judge returned nothing")
-
-    with open(final_report, "w", encoding="utf-8") as fout:
-        for data in results:
-            if data is not None:
-                fout.write(json.dumps(data, ensure_ascii=False) + "\n")
-
-    total            = correct + partial + wrong
-    weighted_score   = (total_score / (total * 2) * 100) if total > 0 else 0
-    strict_score     = (correct / total * 100)            if total > 0 else 0
-
-    combined_total = combined_correct + combined_partial + combined_wrong
-    combined_weighted_score = (combined_total_score / combined_total * 100) if combined_total > 0 else 0
-    combined_strict_score = (combined_correct / combined_total * 100) if combined_total > 0 else 0
-
-    logger.info("\n" + "=" * 40)
-    logger.info("📊 FINAL EVALUATION REPORT")
-    logger.info("-- Judge-only metrics --")
-    logger.info(f"  Total graded:            {total}")
-    logger.info(f"  ✅ Correct  (2):         {correct}")
-    logger.info(f"  ⚠️  Partial  (1):         {partial}   (+{partial} pts)")
-    logger.info(f"  ❌ Wrong      (0):         {wrong}")
-    logger.info(f"  🎯 Weighted score:       {weighted_score:.1f}%  (correct×2 + partial×1)")
-    logger.info(f"  📌 Strict score:         {strict_score:.1f}%   (correct only)")
-    logger.info("-- Faithfulness-adjusted metrics --")
-    logger.info(f"  Total graded:            {combined_total}")
-    logger.info(f"  ✅ Correct  (2):         {combined_correct}")
-    logger.info(f"  ⚠️  Partial  (1):         {combined_partial}   (+{combined_partial} pts)")
-    logger.info(f"  ❌ Wrong      (0):         {combined_wrong}")
-    logger.info(f"  🎯 Combined score:        {combined_weighted_score:.1f}%  (judge+faithfulness)")
-    logger.info(f"  📌 Combined strict score: {combined_strict_score:.1f}%")
-    logger.info(f"  ⏱️  Phase 3 time:         {time.time()-t0:.1f}s")
-    if parse_failures:
-        logger.warning(f"  ⚡ Judge errors:         {parse_failures}")
-    logger.info("=" * 40)
+def _switch_ollama_model(from_model, to_model):
+    logger.info(f"🔄 Switching models: {from_model} → {to_model}")
+    _stop_ollama_model(from_model)
+    logger.info(f"✅ Ready to load: {to_model}")
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
 def main():
-    # Parse command-line arguments
     parser = argparse.ArgumentParser(
         description="Generate evaluation results using RAG inference and judging"
     )
@@ -371,31 +66,159 @@ def main():
         help="Randomly sample N questions (default: 5 questions; set 0 for all questions)"
     )
     parser.add_argument(
+        "--phase2-workers",
+        type=int,
+        default=phase2.PHASE2_WORKERS,
+        help=f"Number of worker threads for phase 2 search/answering (default: {phase2.PHASE2_WORKERS})"
+    )
+    parser.add_argument(
         "--debug",
         action="store_true",
         help="Enable debug logging for more verbose status output"
     )
+    parser.add_argument(
+        "--bug-only",
+        action="store_true",
+        help="Only print bugged/failed question lines; suppress normal progress output."
+    )
+    parser.add_argument(
+        "--answer-model",
+        type=str,
+        default="qwen_35b_a3b_MoE",
+        help="Answer generation model name to use with Ollama (default: qwen_35b_a3b_MoE). Used in Phase 2."
+    )
+    parser.add_argument(
+        "--judge-model",
+        type=str,
+        default="local-llama3.1",
+        help="Judge LLM model name to use with Ollama (default: local-llama3.1). Used in Phase 3. Script will auto-switch from answer-model."
+    )
+    parser.add_argument(
+        "--judge-num-predict",
+        type=int,
+        default=128,
+        help="Max tokens to predict for judge LLM (lower = faster; default: 128)"
+    )
+    parser.add_argument(
+        "--judge-num-ctx",
+        type=int,
+        default=1024,
+        help="Context window for judge LLM (default: 1024)"
+    )
+    parser.add_argument(
+        "--phase3-timeout",
+        type=int,
+        default=PHASE3_TIMEOUT,
+        help=f"Phase 3 timeout in seconds (default: {PHASE3_TIMEOUT})"
+    )
+    parser.add_argument(
+        "--metrics",
+        type=str,
+        default=phase3.DEFAULT_PHASE3_METRICS,
+        help="Comma-separated list of evaluation metrics to run."
+    )
+    parser.add_argument(
+        "--stub-judge",
+        action="store_true",
+        help="Use a fast stub judge that synthesizes metric scores (no LLM calls)."
+    )
+    parser.add_argument(
+        "--per-question-timing",
+        action="store_true",
+        help="Measure and log per-question evaluation time (may slow overall run)."
+    )
+    parser.add_argument(
+        "--test-phase-3",
+        action="store_true",
+        dest="test_phase_3",
+        help="Generate or reuse a single Phase 2 sample and run only Phase 3 for debug testing."
+    )
+    parser.add_argument(
+        "--require-local-judge",
+        action="store_true",
+        help="If set, error out if the configured judge LLM cannot be constructed."
+    )
     args = parser.parse_args()
 
-    if args.debug:
+    if args.bug_only:
+        configure_logging(logging.ERROR)
+        utils.BUG_ONLY = True
+        logger.error("🔎 BUG-ONLY mode active: showing only error diagnostics and critical failure lines")
+    elif args.debug:
         configure_logging(logging.DEBUG)
         logger.debug("Debug logging enabled")
 
-    DATA_FILE    = get_data_file(args.dataset)
-    RAG_ANSWERS  = os.path.join(EVAL_DIR, f"rag_responses_{args.dataset}.jsonl")
-    FINAL_REPORT = os.path.join(EVAL_DIR, f"final_evaluation_{args.dataset}.jsonl")
+    if args.phase2_workers < 1:
+        args.phase2_workers = 1
+
+    if args.test_phase_3:
+        args.sample = 1
+
+    phase2.PHASE2_WORKERS = args.phase2_workers
+
+    data_file = get_data_file(args.dataset)
+    default_rag_answers = os.path.join(EVAL_DIR, f"rag_responses_{args.dataset}.jsonl")
+    phase3_sample_file = os.path.join(EVAL_DIR, f"rag_responses_{args.dataset}_phase3_sample.jsonl")
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    phase3_debug_log = os.path.join(script_dir, f"phase3_debug_{args.dataset}.log")
+    final_report = os.path.join(EVAL_DIR, f"final_evaluation_{args.dataset}.jsonl")
     os.makedirs(EVAL_DIR, exist_ok=True)
 
-    if not os.path.exists(DATA_FILE):
-        logger.error(f"❌ Dataset file not found: {DATA_FILE}")
-        logger.error(f"   Make sure you've run merge_eval_datasets.py first to create the split datasets.")
-        exit(1)
+    if not os.path.exists(data_file):
+        logger.error(f"❌ Dataset file not found: {data_file}")
+        logger.error("   Make sure you've run merge_eval_datasets.py first to create the split datasets.")
+        sys.exit(1)
 
-    logger.info(f"📁 Dataset file: {DATA_FILE}")
+    if args.test_phase_3:
+        if os.path.exists(phase3_sample_file) and os.path.getsize(phase3_sample_file) > 0:
+            rag_answers = phase3_sample_file
+            phase2_required = False
+            logger.info(f"🔁 Reusing saved Phase 3 sample: {phase3_sample_file}")
+        elif os.path.exists(default_rag_answers) and os.path.getsize(default_rag_answers) > 0:
+            logger.info(f"🔁 Found existing Phase 2 output; extracting one sample for Phase 3 debug.")
+            with open(default_rag_answers, "r", encoding="utf-8") as fin:
+                sample_item = None
+                for line in fin:
+                    if line.strip():
+                        sample_item = line
+                        break
+            if sample_item is None:
+                logger.error(f"❌ No valid entries found in {default_rag_answers} to sample from.")
+                sys.exit(1)
+            with open(phase3_sample_file, "w", encoding="utf-8") as fout:
+                fout.write(sample_item)
+            rag_answers = phase3_sample_file
+            phase2_required = False
+            logger.info(f"✅ Saved Phase 3 sample file: {phase3_sample_file}")
+        else:
+            rag_answers = phase3_sample_file
+            phase2_required = True
+            logger.info(f"🔧 No saved sample found; Phase 2 will generate one sample and save it to {phase3_sample_file}")
+
+        with open(phase3_debug_log, "w", encoding="utf-8"):
+            pass
+        root_logger = logging.getLogger()
+        root_logger.setLevel(logging.INFO)
+        for handler in list(root_logger.handlers):
+            if isinstance(handler, logging.StreamHandler):
+                handler.setLevel(logging.INFO)
+        file_handler = logging.FileHandler(phase3_debug_log, mode="w", encoding="utf-8")
+        file_handler.setLevel(logging.INFO)
+        file_handler.setFormatter(logging.Formatter('%(asctime)s | %(levelname)s | %(name)s | %(message)s'))
+        root_logger.addHandler(file_handler)
+        logger.info(f"📄 Phase 3 debug output will be written to: {phase3_debug_log}")
+        debug_phase3 = True
+    else:
+        rag_answers = default_rag_answers
+        phase2_required = True
+        debug_phase3 = False
+
+    logger.info(f"📁 Dataset file: {data_file}")
     logger.info(f"🐘 Process ID: {os.getpid()}")
+    logger.info(f"🧮 CPU count: {os.cpu_count() or 1}; Phase 2 workers: {args.phase2_workers}")
     logger.info("⏱️  Counting questions in dataset file...")
-    q_count = sum(1 for l in open(DATA_FILE, encoding="utf-8") if l.strip())
-    logger.info(f"📋 Loaded {q_count} questions from '{DATA_FILE}' (dataset: {args.dataset})")
+    q_count = sum(1 for l in open(data_file, encoding="utf-8") if l.strip())
+    logger.info(f"📋 Loaded {q_count} questions from '{data_file}' (dataset: {args.dataset})")
 
     brain = Brain()
     logger.info(f"🧠 Brain indices present? {brain.is_built()}")
@@ -406,15 +229,90 @@ def main():
         logger.info("🔄 Syncing indices...")
         brain.sync_indices()
 
-    logger.info("🚀 Starting Phase 2 (RAG inference). This may take a while, especially on the first question.")
-    run_rag_inference(brain, args, DATA_FILE, RAG_ANSWERS)
+    if phase2_required:
+        logger.info("🚀 Starting Phase 2 (RAG inference). This may take a while, especially on the first question.")
+        phase2.run_rag_inference(brain, args, data_file, rag_answers)
+    else:
+        logger.info("🔁 Skipping Phase 2; using saved Phase 3 sample for Phase 3 debug.")
+
+    if args.answer_model != args.judge_model:
+        logger.info("\n" + "=" * 60)
+        _switch_ollama_model(args.answer_model, args.judge_model)
+        logger.info("=" * 60 + "\n")
+
     logger.info("🚀 Starting Phase 3 (Judge & report).")
-    run_judge_and_report(RAG_ANSWERS, FINAL_REPORT)
+    logger.info(f"📋 Using judge model: {args.judge_model}")
+    judge_llm = None
+    try:
+        judge_llm = OllamaLLM(
+            model=args.judge_model,
+            base_url="http://localhost:11434",
+            temperature=0.0,
+            num_ctx=args.judge_num_ctx,
+            keep_alive=-1,
+            num_predict=args.judge_num_predict,
+            stop=[
+                "<|eot_id|>",
+                "<|end_header_id|>",
+                "\n\n",
+                "---",
+                "Note:", "Important:",
+                "Q:", "Question:",
+                "Đó là", "Do đó",
+            ]
+        )
+        logger.info("🔧 Judge LLM constructed successfully")
+        log_method = logger.info if args.test_phase_3 else logger.debug
+        log_method(
+            "🔧 Judge LLM internals: model=%s num_ctx=%s num_predict=%s temperature=%s stop=%s",
+            getattr(judge_llm, 'model', None),
+            getattr(judge_llm, 'num_ctx', None),
+            getattr(judge_llm, 'num_predict', None),
+            getattr(judge_llm, 'temperature', None),
+            getattr(judge_llm, 'stop', None),
+        )
+        log_method("🔧 Judge LLM repr: %s", repr(judge_llm))
+    except Exception as e:
+        logger.error(f"Failed to construct judge LLM '{args.judge_model}': {e}")
+        if args.require_local_judge:
+            logger.error("--require-local-judge is set; aborting.")
+            sys.exit(1)
+        if not args.stub_judge:
+            logger.error("Judge LLM unavailable and --stub-judge not set. Aborting.")
+            sys.exit(1)
+        logger.warning("Proceeding with stub judge due to judge LLM construction failure.")
+
+    run_judge_and_report(
+        rag_answers,
+        final_report,
+        judge_llm,
+        phase3_timeout=args.phase3_timeout,
+        selected_metrics=args.metrics,
+        stub_judge=args.stub_judge,
+        per_question_timing=args.per_question_timing,
+        debug_phase3=args.test_phase_3,
+    )
+
+    if os.path.exists(final_report):
+        with open(final_report, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+            if lines:
+                try:
+                    first_result = json.loads(lines[0])
+                    has_missing_metrics = any(
+                        first_result.get(m) is None
+                        for m in ['phoenix_faithfulness', 'phoenix_answer_accuracy', 'phoenix_context_precision']
+                    )
+                    if has_missing_metrics:
+                        logger.warning("\n⚠️  Some evaluation metrics have None values (label not matched).")
+                        logger.warning("   This suggests your judge model is not returning a recognised label.")
+                        logger.warning(f"   Try a different model:")
+                        logger.warning(f"   python -m src.eval.generate_evals --dataset {args.dataset} --judge-model neural-chat")
+                        logger.warning(f"   or use stub judge for testing:")
+                        logger.warning(f"   python -m src.eval.generate_evals --dataset {args.dataset} --stub-judge")
+                except Exception:
+                    pass
 
 
 if __name__ == "__main__":
-    logging.basicConfig(
-        level=logging.INFO,
-        format='%(asctime)s | %(levelname)s | %(message)s',
-    )
     main()
